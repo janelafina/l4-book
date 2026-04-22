@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+# Capture data — contains per-account endpoint in the header; too large anyway
+/benchmark_data/
+*.jsonl
+# Python
+.venv/
+__pycache__/
+*.pyc
+# macOS
+.DS_Store
+# IDE
+.idea/
+.vscode/
