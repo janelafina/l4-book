@@ -40,16 +40,25 @@ fn load() -> Capture {
 fn apply_ops(book: &mut OrderBook, ops: &[BookOp]) {
     for op in ops {
         match op {
-            BookOp::Add(o) => { let _ = book.add(*o); }
-            BookOp::Remove(id) => { let _ = book.remove(*id); }
-            BookOp::UpdateSize { id, new_qty } => { let _ = book.update_size(*id, *new_qty); }
-            BookOp::AmendSize { id, new_qty } => { let _ = book.amend_size(*id, *new_qty); }
+            BookOp::Add(o) => {
+                let _ = book.add(*o);
+            }
+            BookOp::Remove(id) => {
+                let _ = book.remove(*id);
+            }
+            BookOp::UpdateSize { id, new_qty } => {
+                let _ = book.update_size(*id, *new_qty);
+            }
+            BookOp::AmendSize { id, new_qty } => {
+                let _ = book.amend_size(*id, *new_qty);
+            }
         }
     }
 }
 
 fn apply_snapshot(book: &mut OrderBook, snapshot: &[Order]) {
-    book.apply_snapshot(snapshot.iter().copied()).expect("apply snapshot");
+    book.apply_snapshot(snapshot.iter().copied())
+        .expect("apply snapshot");
 }
 
 fn bench_snapshot(c: &mut Criterion, cap: &Capture) {

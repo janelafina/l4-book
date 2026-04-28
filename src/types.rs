@@ -73,7 +73,10 @@ pub enum BookError {
     ZeroQty,
     /// Attempted a size update that doesn't shrink (partial-fill updates must
     /// strictly decrease; amends may go either way, so they use a separate path).
-    NonDecreasingSize { current: Qty, proposed: Qty },
+    NonDecreasingSize {
+        current: Qty,
+        proposed: Qty,
+    },
     InvalidWalletHex,
 }
 
@@ -84,7 +87,10 @@ impl fmt::Display for BookError {
             BookError::UnknownOrderId(oid) => write!(f, "unknown order id {oid}"),
             BookError::ZeroQty => write!(f, "order qty must be nonzero"),
             BookError::NonDecreasingSize { current, proposed } => {
-                write!(f, "update_size must shrink: current={current} proposed={proposed}")
+                write!(
+                    f,
+                    "update_size must shrink: current={current} proposed={proposed}"
+                )
             }
             BookError::InvalidWalletHex => write!(f, "invalid wallet hex"),
         }

@@ -14,5 +14,8 @@ mod types;
 #[cfg(feature = "dwellir")]
 pub mod dwellir;
 
-pub use book::{DepthIter, OrderBook, OrdersAtLevel, WalletIter};
+pub use book::{
+    AggregatedLevel, AggregatedTopLevels, DepthIter, LevelOrder, OrderBook, OrdersAtLevel,
+    SlippageEstimate, UnaggregatedLevel, UnaggregatedTopLevels, WalletIter,
+};
 pub use types::{BookError, Order, OrderId, Price, Qty, Side, Ts, WalletId};

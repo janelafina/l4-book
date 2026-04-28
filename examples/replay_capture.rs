@@ -27,7 +27,8 @@ fn main() {
 
     let mut book = OrderBook::with_capacity(cap.snapshot.len() + 65_536);
     let t1 = Instant::now();
-    book.apply_snapshot(cap.snapshot.iter().copied()).expect("snapshot");
+    book.apply_snapshot(cap.snapshot.iter().copied())
+        .expect("snapshot");
     let snap_s = t1.elapsed().as_secs_f64();
     println!(
         "snapshot applied: {:.3}s  ({} orders, {:.0} orders/s)",
@@ -37,8 +38,13 @@ fn main() {
     );
     #[cfg(debug_assertions)]
     book.assert_invariants();
-    println!("  best_bid={:?}  best_ask={:?}  spread={:?}", book.best_bid(), book.best_ask(),
-             book.best_ask().and_then(|a| book.best_bid().map(|b| a.saturating_sub(b))));
+    println!(
+        "  best_bid={:?}  best_ask={:?}  spread={:?}",
+        book.best_bid(),
+        book.best_ask(),
+        book.best_ask()
+            .and_then(|a| book.best_bid().map(|b| a.saturating_sub(b)))
+    );
 
     let t2 = Instant::now();
     let mut errs_add = 0u64;
@@ -48,10 +54,26 @@ fn main() {
     for ops in &cap.updates {
         for op in ops {
             match op {
-                BookOp::Add(o) => if book.add(*o).is_err() { errs_add += 1 },
-                BookOp::Remove(id) => if book.remove(*id).is_err() { errs_rm += 1 },
-                BookOp::UpdateSize { id, new_qty } => if book.update_size(*id, *new_qty).is_err() { errs_upd += 1 },
-                BookOp::AmendSize { id, new_qty } => if book.amend_size(*id, *new_qty).is_err() { errs_amend += 1 },
+                BookOp::Add(o) => {
+                    if book.add(*o).is_err() {
+                        errs_add += 1
+                    }
+                }
+                BookOp::Remove(id) => {
+                    if book.remove(*id).is_err() {
+                        errs_rm += 1
+                    }
+                }
+                BookOp::UpdateSize { id, new_qty } => {
+                    if book.update_size(*id, *new_qty).is_err() {
+                        errs_upd += 1
+                    }
+                }
+                BookOp::AmendSize { id, new_qty } => {
+                    if book.amend_size(*id, *new_qty).is_err() {
+                        errs_amend += 1
+                    }
+                }
             }
         }
     }

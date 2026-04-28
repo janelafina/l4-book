@@ -1,8 +1,86 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::collections::btree_map;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::level::{Level, OrderNode};
-use crate::types::{BookError, Order, OrderId, Price, Qty, Side, WalletId};
+use crate::types::{BookError, Order, OrderId, Price, Qty, Side, Ts, WalletId};
+
+/// A named aggregate price level snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregatedLevel {
+    pub price: Price,
+    pub total_qty: Qty,
+    pub order_count: u64,
+}
+
+/// Top-of-book aggregate depth for both sides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AggregatedTopLevels {
+    /// Bid levels in best-to-worse order (highest price first).
+    pub bids: Vec<AggregatedLevel>,
+    /// Ask levels in best-to-worse order (lowest price first).
+    pub asks: Vec<AggregatedLevel>,
+}
+
+/// Per-order data in an unaggregated level snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LevelOrder {
+    pub id: OrderId,
+    pub wallet: WalletId,
+    pub qty: Qty,
+    pub ts: Ts,
+}
+
+/// One price level containing its resting orders in FIFO order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnaggregatedLevel {
+    pub price: Price,
+    pub orders: Vec<LevelOrder>,
+}
+
+/// Top-of-book unaggregated depth for both sides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnaggregatedTopLevels {
+    /// Bid levels in best-to-worse order (highest price first).
+    pub bids: Vec<UnaggregatedLevel>,
+    /// Ask levels in best-to-worse order (lowest price first).
+    pub asks: Vec<UnaggregatedLevel>,
+}
+
+/// Slippage estimate for a hypothetical taker order.
+///
+/// `taker_side` follows normal order side semantics: `Side::Bid` is a buy that
+/// consumes asks, and `Side::Ask` is a sell that consumes bids. Slippage is the
+/// adverse average-price move versus the current best opposite quote: buy
+/// slippage is `average_price - best_ask`; sell slippage is
+/// `best_bid - average_price`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlippageEstimate {
+    pub taker_side: Side,
+    pub requested_qty: Qty,
+    pub filled_qty: Qty,
+    pub unfilled_qty: Qty,
+    /// Sum of `execution_price * filled_qty` across walked levels.
+    pub filled_notional: u128,
+    pub limit_price: Price,
+    pub reference_price: Option<Price>,
+    pub average_price: Option<f64>,
+    /// Adverse average-price move versus `reference_price`.
+    pub slippage: Option<f64>,
+    /// Exact adverse extra notional versus filling all executed quantity at
+    /// `reference_price`.
+    pub slippage_notional: Option<u128>,
+    pub slippage_pct: Option<f64>,
+    /// True when the next available resting price would violate `limit_price`.
+    pub limit_stopped: bool,
+    /// True when the acceptable opposite book was exhausted before filling.
+    pub exhausted_book: bool,
+}
+
+impl SlippageEstimate {
+    pub fn is_complete(&self) -> bool {
+        self.unfilled_qty == 0
+    }
+}
 
 /// A limit order book with per-order wallet attribution.
 ///
@@ -65,7 +143,10 @@ impl OrderBook {
     }
 
     /// Replace all book state with the provided orders.
-    pub fn apply_snapshot<I: IntoIterator<Item = Order>>(&mut self, orders: I) -> Result<(), BookError> {
+    pub fn apply_snapshot<I: IntoIterator<Item = Order>>(
+        &mut self,
+        orders: I,
+    ) -> Result<(), BookError> {
         self.clear();
         for order in orders {
             self.add(order)?;
@@ -95,7 +176,10 @@ impl OrderBook {
         let node = OrderNode::new(order);
         self.slab[slot] = Some(node);
         self.order_index.insert(order.id, slot);
-        self.wallet_index.entry(order.wallet).or_default().insert(order.id);
+        self.wallet_index
+            .entry(order.wallet)
+            .or_default()
+            .insert(order.id);
 
         let levels = match order.side {
             Side::Bid => &mut self.bids,
@@ -110,8 +194,13 @@ impl OrderBook {
 
     /// Remove and return the order with the given id.
     pub fn remove(&mut self, id: OrderId) -> Result<Order, BookError> {
-        let slot = self.order_index.remove(&id).ok_or(BookError::UnknownOrderId(id))?;
-        let node = self.slab[slot].take().expect("slab slot present for indexed order");
+        let slot = self
+            .order_index
+            .remove(&id)
+            .ok_or(BookError::UnknownOrderId(id))?;
+        let node = self.slab[slot]
+            .take()
+            .expect("slab slot present for indexed order");
         self.free_list.push(slot);
 
         let order = node.order;
@@ -120,7 +209,9 @@ impl OrderBook {
             Side::Ask => &mut self.asks,
         };
         let remove_level = {
-            let level = levels.get_mut(&order.price).expect("level present for resting order");
+            let level = levels
+                .get_mut(&order.price)
+                .expect("level present for resting order");
             level.order_count -= 1;
             level.total_qty -= order.qty;
             unlink(&mut self.slab, level, node.prev, node.next);
@@ -143,19 +234,31 @@ impl OrderBook {
     /// must be strictly less than the current qty. If `new_qty == 0` the order
     /// is removed. Preserves queue position.
     pub fn update_size(&mut self, id: OrderId, new_qty: Qty) -> Result<(), BookError> {
-        let slot = *self.order_index.get(&id).ok_or(BookError::UnknownOrderId(id))?;
+        let slot = *self
+            .order_index
+            .get(&id)
+            .ok_or(BookError::UnknownOrderId(id))?;
         let (current, side, price) = {
-            let node = self.slab[slot].as_ref().expect("slab slot present for indexed order");
+            let node = self.slab[slot]
+                .as_ref()
+                .expect("slab slot present for indexed order");
             (node.order.qty, node.order.side, node.order.price)
         };
         if new_qty >= current {
-            return Err(BookError::NonDecreasingSize { current, proposed: new_qty });
+            return Err(BookError::NonDecreasingSize {
+                current,
+                proposed: new_qty,
+            });
         }
         if new_qty == 0 {
             self.remove(id)?;
             return Ok(());
         }
-        self.slab[slot].as_mut().expect("slab slot present").order.qty = new_qty;
+        self.slab[slot]
+            .as_mut()
+            .expect("slab slot present")
+            .order
+            .qty = new_qty;
         let levels = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
@@ -172,15 +275,24 @@ impl OrderBook {
             self.remove(id)?;
             return Ok(());
         }
-        let slot = *self.order_index.get(&id).ok_or(BookError::UnknownOrderId(id))?;
+        let slot = *self
+            .order_index
+            .get(&id)
+            .ok_or(BookError::UnknownOrderId(id))?;
         let (current, side, price) = {
-            let node = self.slab[slot].as_ref().expect("slab slot present for indexed order");
+            let node = self.slab[slot]
+                .as_ref()
+                .expect("slab slot present for indexed order");
             (node.order.qty, node.order.side, node.order.price)
         };
         if current == new_qty {
             return Ok(());
         }
-        self.slab[slot].as_mut().expect("slab slot present").order.qty = new_qty;
+        self.slab[slot]
+            .as_mut()
+            .expect("slab slot present")
+            .order
+            .qty = new_qty;
         let levels = match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
@@ -207,6 +319,122 @@ impl OrderBook {
         self.asks.keys().next().copied()
     }
 
+    /// Return best bid and ask together.
+    pub fn best_bid_ask(&self) -> (Option<Price>, Option<Price>) {
+        (self.best_bid(), self.best_ask())
+    }
+
+    /// Return the first `n` levels per side as aggregate snapshots.
+    ///
+    /// Bids are ordered best-to-worse (descending price); asks are ordered
+    /// best-to-worse (ascending price).
+    pub fn top_n_levels_aggregated(&self, n: usize) -> AggregatedTopLevels {
+        AggregatedTopLevels {
+            bids: self.top_n_levels_aggregated_for_side(Side::Bid, n),
+            asks: self.top_n_levels_aggregated_for_side(Side::Ask, n),
+        }
+    }
+
+    /// Return the first `n` levels per side with individual resting orders.
+    ///
+    /// Orders inside each level preserve FIFO time priority. The level count is
+    /// capped, but every order in each returned level is copied into the
+    /// snapshot.
+    pub fn top_n_levels(&self, n: usize) -> UnaggregatedTopLevels {
+        UnaggregatedTopLevels {
+            bids: self.top_n_levels_for_side(Side::Bid, n),
+            asks: self.top_n_levels_for_side(Side::Ask, n),
+        }
+    }
+
+    /// Estimate execution and slippage for a hypothetical limit taker order.
+    ///
+    /// `taker_side` is the side of the incoming order: `Side::Bid` buys from
+    /// asks up to `limit_price`, while `Side::Ask` sells into bids down to
+    /// `limit_price`. The book is not mutated. Partial fills are represented by
+    /// `filled_qty`, `unfilled_qty`, `limit_stopped`, and `exhausted_book`.
+    pub fn estimate_slippage(
+        &self,
+        taker_side: Side,
+        qty: Qty,
+        limit_price: Price,
+    ) -> SlippageEstimate {
+        let reference_price = match taker_side {
+            Side::Bid => self.best_ask(),
+            Side::Ask => self.best_bid(),
+        };
+        let opposite_side = match taker_side {
+            Side::Bid => Side::Ask,
+            Side::Ask => Side::Bid,
+        };
+
+        let mut remaining = qty;
+        let mut notional = 0u128;
+        let mut limit_stopped = false;
+
+        if remaining > 0 {
+            for (price, level_qty, _) in self.depth(opposite_side) {
+                if !limit_allows(taker_side, price, limit_price) {
+                    limit_stopped = true;
+                    break;
+                }
+
+                let take = remaining.min(level_qty);
+                notional += price as u128 * take as u128;
+                remaining -= take;
+
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+
+        let filled_qty = qty - remaining;
+        let average_price = if filled_qty > 0 {
+            Some(notional as f64 / filled_qty as f64)
+        } else {
+            None
+        };
+        let slippage = match (average_price, reference_price) {
+            (Some(avg), Some(reference)) => Some(match taker_side {
+                Side::Bid => avg - reference as f64,
+                Side::Ask => reference as f64 - avg,
+            }),
+            _ => None,
+        };
+        let slippage_pct = match (slippage, reference_price) {
+            (Some(slip), Some(reference)) if reference > 0 => Some(slip / reference as f64 * 100.0),
+            _ => None,
+        };
+        let slippage_notional = if filled_qty > 0 {
+            reference_price.map(|reference| {
+                let reference_notional = reference as u128 * filled_qty as u128;
+                match taker_side {
+                    Side::Bid => notional.saturating_sub(reference_notional),
+                    Side::Ask => reference_notional.saturating_sub(notional),
+                }
+            })
+        } else {
+            None
+        };
+
+        SlippageEstimate {
+            taker_side,
+            requested_qty: qty,
+            filled_qty,
+            unfilled_qty: remaining,
+            filled_notional: notional,
+            limit_price,
+            reference_price,
+            average_price,
+            slippage,
+            slippage_notional,
+            slippage_pct,
+            limit_stopped,
+            exhausted_book: remaining > 0 && !limit_stopped,
+        }
+    }
+
     /// Iterate levels of a side in priority order (best first), yielding
     /// `(price, total_qty, order_count)`.
     pub fn depth(&self, side: Side) -> DepthIter<'_> {
@@ -224,7 +452,10 @@ impl OrderBook {
             Side::Ask => &self.asks,
         };
         let head = levels.get(&price).and_then(|l| l.head);
-        OrdersAtLevel { slab: &self.slab, next: head }
+        OrdersAtLevel {
+            slab: &self.slab,
+            next: head,
+        }
     }
 
     /// Iterate every order belonging to a wallet. Order is unspecified (hash
@@ -271,6 +502,42 @@ impl OrderBook {
             self.slab.push(None);
             self.slab.len() - 1
         }
+    }
+
+    fn top_n_levels_aggregated_for_side(&self, side: Side, n: usize) -> Vec<AggregatedLevel> {
+        self.depth(side)
+            .take(n)
+            .map(|(price, total_qty, order_count)| AggregatedLevel {
+                price,
+                total_qty,
+                order_count,
+            })
+            .collect()
+    }
+
+    fn top_n_levels_for_side(&self, side: Side, n: usize) -> Vec<UnaggregatedLevel> {
+        self.depth(side)
+            .take(n)
+            .map(|(price, _, _)| UnaggregatedLevel {
+                price,
+                orders: self
+                    .orders_at(side, price)
+                    .map(|order| LevelOrder {
+                        id: order.id,
+                        wallet: order.wallet,
+                        qty: order.qty,
+                        ts: order.ts,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+}
+
+fn limit_allows(taker_side: Side, resting_price: Price, limit_price: Price) -> bool {
+    match taker_side {
+        Side::Bid => resting_price <= limit_price,
+        Side::Ask => resting_price >= limit_price,
     }
 }
 

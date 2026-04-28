@@ -44,9 +44,44 @@ book.amend_size(id, new_qty)?;    // may grow or shrink
 book.remove(id)?;
 
 book.best_bid();                                 // Option<Price>
+book.best_bid_ask();                             // (Option<Price>, Option<Price>)
 book.depth(Side::Bid);                           // iter (price, total_qty, order_count)
 book.orders_at(Side::Bid, price);                // iter &Order in FIFO order
 book.orders_by_wallet(wallet);                   // iter &Order
+```
+
+### Top-of-book snapshots and slippage
+
+For UI/API consumers that want owned snapshots instead of iterators:
+
+```rust
+let top = book.top_n_levels(5);
+// top.bids: best-to-worse bid levels (descending price)
+// top.asks: best-to-worse ask levels (ascending price)
+// each level has { price, orders }, with FIFO orders containing id, wallet, qty, ts
+// note: all orders in each selected price level are copied into the snapshot
+
+let agg = book.top_n_levels_aggregated(5);
+// each level has { price, total_qty, order_count }
+```
+
+Slippage estimates are taker-side oriented: `Side::Bid` means a buy that
+consumes asks up to the limit price, and `Side::Ask` means a sell that consumes
+bids down to the limit price. The book is not mutated.
+
+```rust
+let est = book.estimate_slippage(Side::Bid, 10_000, 50_100);
+
+est.average_price;   // Option<f64>
+est.filled_notional; // exact sum(price * qty) as u128
+est.slippage;        // raw average-price move vs current best ask/bid
+est.slippage_notional; // exact total slippage notional vs current best ask/bid
+est.slippage_pct;    // percent move vs current best ask/bid
+est.filled_qty;
+est.unfilled_qty;
+est.limit_stopped;   // next available price violated the limit
+est.exhausted_book;  // acceptable opposite liquidity ran out
+est.is_complete();
 ```
 
 ### Design choices

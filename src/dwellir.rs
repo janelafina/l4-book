@@ -24,9 +24,15 @@ pub enum BookOp {
     Add(Order),
     Remove(OrderId),
     /// Partial-fill size reduction. Strictly decreasing per L4 semantics.
-    UpdateSize { id: OrderId, new_qty: Qty },
+    UpdateSize {
+        id: OrderId,
+        new_qty: Qty,
+    },
     /// Amendment; may grow or shrink.
-    AmendSize { id: OrderId, new_qty: Qty },
+    AmendSize {
+        id: OrderId,
+        new_qty: Qty,
+    },
 }
 
 /// One line of the capture file, decoded.
@@ -88,10 +94,14 @@ impl std::fmt::Display for AdapterError {
 impl std::error::Error for AdapterError {}
 
 impl From<std::io::Error> for AdapterError {
-    fn from(e: std::io::Error) -> Self { AdapterError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        AdapterError::Io(e)
+    }
 }
 impl From<serde_json::Error> for AdapterError {
-    fn from(e: serde_json::Error) -> Self { AdapterError::Json(e) }
+    fn from(e: serde_json::Error) -> Self {
+        AdapterError::Json(e)
+    }
 }
 
 /// Number of fractional decimal digits preserved when converting wire strings
@@ -104,7 +114,10 @@ pub struct Scales {
 }
 
 impl Scales {
-    pub const BTC_DEFAULT: Scales = Scales { price_digits: 6, qty_digits: 8 };
+    pub const BTC_DEFAULT: Scales = Scales {
+        price_digits: 6,
+        qty_digits: 8,
+    };
 }
 
 /// Decode a single JSONL line. Returns `Decoded::Skip` for the capture header
@@ -129,9 +142,14 @@ pub fn decode_line(line: &str, scales: Scales) -> Result<Decoded, AdapterError> 
 fn decode_l4(msg: &Value, scales: Scales) -> Result<Decoded, AdapterError> {
     let data = msg.get("data").ok_or(AdapterError::MissingField("data"))?;
     if let Some(snap) = data.get("Snapshot") {
-        let levels = snap.get("levels").ok_or(AdapterError::MissingField("levels"))?;
-        let arr = levels.as_array().ok_or(AdapterError::MissingField("levels[]"))?;
-        let mut out = Vec::with_capacity(arr.iter().map(|s| s.as_array().map_or(0, Vec::len)).sum());
+        let levels = snap
+            .get("levels")
+            .ok_or(AdapterError::MissingField("levels"))?;
+        let arr = levels
+            .as_array()
+            .ok_or(AdapterError::MissingField("levels[]"))?;
+        let mut out =
+            Vec::with_capacity(arr.iter().map(|s| s.as_array().map_or(0, Vec::len)).sum());
         // levels[0] = bids, levels[1] = asks — side is also on each order though.
         for side_arr in arr {
             if let Some(orders) = side_arr.as_array() {
@@ -150,7 +168,8 @@ fn decode_l4(msg: &Value, scales: Scales) -> Result<Decoded, AdapterError> {
 
 fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, AdapterError> {
     // Stash order_statuses by oid so we can enrich `new` diffs with side/ts.
-    let mut status_by_oid: std::collections::HashMap<OrderId, &Value> = std::collections::HashMap::new();
+    let mut status_by_oid: std::collections::HashMap<OrderId, &Value> =
+        std::collections::HashMap::new();
     if let Some(arr) = updates.get("order_statuses").and_then(Value::as_array) {
         for s in arr {
             if let Some(order) = s.get("order") {
@@ -167,44 +186,71 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, Adapte
     };
     let mut ops = Vec::with_capacity(diffs.len());
     for d in diffs {
-        let oid = d.get("oid").and_then(Value::as_u64)
+        let oid = d
+            .get("oid")
+            .and_then(Value::as_u64)
             .ok_or(AdapterError::MissingField("book_diff.oid"))?;
-        let raw = d.get("raw_book_diff").ok_or(AdapterError::MissingField("raw_book_diff"))?;
+        let raw = d
+            .get("raw_book_diff")
+            .ok_or(AdapterError::MissingField("raw_book_diff"))?;
 
         // "remove" is the plain string form.
         if raw.as_str() == Some("remove") {
             ops.push(BookOp::Remove(oid));
             continue;
         }
-        let raw_obj = raw.as_object().ok_or(AdapterError::MissingField("raw_book_diff{}"))?;
+        let raw_obj = raw
+            .as_object()
+            .ok_or(AdapterError::MissingField("raw_book_diff{}"))?;
 
         if let Some(new_obj) = raw_obj.get("new") {
             // Build an Order by combining the diff (user, px) with the matching
             // order_status (side, timestamp). Size comes from the `new` payload.
-            let sz_str = new_obj.get("sz").and_then(Value::as_str)
+            let sz_str = new_obj
+                .get("sz")
+                .and_then(Value::as_str)
                 .ok_or(AdapterError::MissingField("new.sz"))?;
-            let px_str = d.get("px").and_then(Value::as_str)
+            let px_str = d
+                .get("px")
+                .and_then(Value::as_str)
                 .ok_or(AdapterError::MissingField("book_diff.px"))?;
-            let user_str = d.get("user").and_then(Value::as_str)
+            let user_str = d
+                .get("user")
+                .and_then(Value::as_str)
                 .ok_or(AdapterError::MissingField("book_diff.user"))?;
             let Some(status) = status_by_oid.get(&oid) else {
                 // `new` without matching order_status — skip; adapter caller can
                 // count these via stats to detect capture gaps.
                 continue;
             };
-            let order_obj = status.get("order").ok_or(AdapterError::MissingField("order"))?;
+            let order_obj = status
+                .get("order")
+                .ok_or(AdapterError::MissingField("order"))?;
             let side = parse_side(order_obj.get("side").and_then(Value::as_str).unwrap_or(""))?;
-            let ts = order_obj.get("timestamp").and_then(Value::as_u64).unwrap_or(0);
-            let wallet = WalletId::from_hex(user_str).map_err(|_| AdapterError::BadWallet(user_str.into()))?;
+            let ts = order_obj
+                .get("timestamp")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let wallet = WalletId::from_hex(user_str)
+                .map_err(|_| AdapterError::BadWallet(user_str.into()))?;
             let price = parse_fixed(px_str, scales.price_digits)
                 .ok_or_else(|| AdapterError::BadPrice(px_str.into()))?;
             let qty = parse_fixed(sz_str, scales.qty_digits)
                 .ok_or_else(|| AdapterError::BadQty(sz_str.into()))?;
-            ops.push(BookOp::Add(Order { id: oid, wallet, side, price, qty, ts }));
+            ops.push(BookOp::Add(Order {
+                id: oid,
+                wallet,
+                side,
+                price,
+                qty,
+                ts,
+            }));
             continue;
         }
         if let Some(upd) = raw_obj.get("update") {
-            let new_sz = upd.get("newSz").and_then(Value::as_str)
+            let new_sz = upd
+                .get("newSz")
+                .and_then(Value::as_str)
                 .ok_or(AdapterError::MissingField("update.newSz"))?;
             let new_qty = parse_fixed(new_sz, scales.qty_digits)
                 .ok_or_else(|| AdapterError::BadQty(new_sz.into()))?;
@@ -212,7 +258,9 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, Adapte
             continue;
         }
         if let Some(m) = raw_obj.get("modified") {
-            let sz = m.get("sz").and_then(Value::as_str)
+            let sz = m
+                .get("sz")
+                .and_then(Value::as_str)
                 .ok_or(AdapterError::MissingField("modified.sz"))?;
             let new_qty = parse_fixed(sz, scales.qty_digits)
                 .ok_or_else(|| AdapterError::BadQty(sz.into()))?;
@@ -224,27 +272,47 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, Adapte
     Ok(ops)
 }
 
-fn parse_order(o: &Value, default_side: Option<Side>, scales: Scales) -> Result<Order, AdapterError> {
-    let oid = o.get("oid").and_then(Value::as_u64)
+fn parse_order(
+    o: &Value,
+    default_side: Option<Side>,
+    scales: Scales,
+) -> Result<Order, AdapterError> {
+    let oid = o
+        .get("oid")
+        .and_then(Value::as_u64)
         .ok_or(AdapterError::MissingField("oid"))?;
-    let user_str = o.get("user").and_then(Value::as_str)
+    let user_str = o
+        .get("user")
+        .and_then(Value::as_str)
         .ok_or(AdapterError::MissingField("user"))?;
     let side_str = o.get("side").and_then(Value::as_str);
     let side = match side_str {
         Some(s) => parse_side(s)?,
         None => default_side.ok_or(AdapterError::MissingField("side"))?,
     };
-    let px_str = o.get("limitPx").and_then(Value::as_str)
+    let px_str = o
+        .get("limitPx")
+        .and_then(Value::as_str)
         .ok_or(AdapterError::MissingField("limitPx"))?;
-    let sz_str = o.get("sz").and_then(Value::as_str)
+    let sz_str = o
+        .get("sz")
+        .and_then(Value::as_str)
         .ok_or(AdapterError::MissingField("sz"))?;
     let ts = o.get("timestamp").and_then(Value::as_u64).unwrap_or(0);
-    let wallet = WalletId::from_hex(user_str).map_err(|_| AdapterError::BadWallet(user_str.into()))?;
+    let wallet =
+        WalletId::from_hex(user_str).map_err(|_| AdapterError::BadWallet(user_str.into()))?;
     let price = parse_fixed(px_str, scales.price_digits)
         .ok_or_else(|| AdapterError::BadPrice(px_str.into()))?;
     let qty = parse_fixed(sz_str, scales.qty_digits)
         .ok_or_else(|| AdapterError::BadQty(sz_str.into()))?;
-    Ok(Order { id: oid, wallet, side, price, qty, ts })
+    Ok(Order {
+        id: oid,
+        wallet,
+        side,
+        price,
+        qty,
+        ts,
+    })
 }
 
 fn parse_side(s: &str) -> Result<Side, AdapterError> {
@@ -272,8 +340,12 @@ pub fn parse_fixed(s: &str, scale_digits: u32) -> Option<u64> {
     let mut frac = 0u64;
     let mut digits = 0u32;
     for &b in frac_part.as_bytes() {
-        if digits >= scale_digits { break; }
-        if !b.is_ascii_digit() { return None; }
+        if digits >= scale_digits {
+            break;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
         frac = frac * 10 + (b - b'0') as u64;
         digits += 1;
     }
@@ -297,7 +369,9 @@ pub fn load_capture(path: impl AsRef<Path>, scales: Scales) -> Result<Capture, A
 
     for line in reader.lines() {
         let line = line?;
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         stats.lines += 1;
         match decode_line(&line, scales)? {
             Decoded::Skip => {}
@@ -320,7 +394,11 @@ pub fn load_capture(path: impl AsRef<Path>, scales: Scales) -> Result<Capture, A
         }
     }
 
-    Ok(Capture { snapshot, updates, stats })
+    Ok(Capture {
+        snapshot,
+        updates,
+        stats,
+    })
 }
 
 #[cfg(test)]

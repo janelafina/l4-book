@@ -26,6 +26,10 @@ pub(crate) struct OrderNode {
 
 impl OrderNode {
     pub fn new(order: Order) -> Self {
-        OrderNode { order, next: None, prev: None }
+        OrderNode {
+            order,
+            next: None,
+            prev: None,
+        }
     }
 }
