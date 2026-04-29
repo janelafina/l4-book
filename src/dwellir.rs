@@ -41,7 +41,21 @@ pub enum Decoded {
     /// Capture header / subscriptionResponse / unrecognized — nothing to apply.
     Skip,
     Snapshot(Vec<Order>),
-    Updates(Vec<BookOp>),
+    Updates(UpdateBatch),
+}
+
+/// Decoded `Updates` payload: ops to apply plus counts of protocol quirks the
+/// adapter collapsed away. The counts let callers expose feed-quality metrics
+/// without re-walking the raw message.
+#[derive(Debug, Default, Clone)]
+pub struct UpdateBatch {
+    pub ops: Vec<BookOp>,
+    /// `update {newSz: "0"}` (or `modified {sz: "0"}`) diffs that were rewritten
+    /// to a `Remove` because the order's last size went to zero.
+    pub collapsed_complete_fills: usize,
+    /// Explicit `remove` diffs dropped because we already issued a Remove for
+    /// that oid earlier in the same message.
+    pub dropped_duplicate_removes: usize,
 }
 
 /// Whole-file decode result.
@@ -64,6 +78,13 @@ pub struct CaptureStats {
     pub size_amends: usize,
     /// `new` diffs we couldn't match to an `open` order_status in the same message.
     pub unresolved_new: usize,
+    /// `update`/`modified` diffs with `newSz=0` rewritten to `Remove` because
+    /// the order's last size went to zero (typically a complete fill that
+    /// Hyperliquid encodes as size-to-zero plus a separate remove diff).
+    pub collapsed_complete_fills: usize,
+    /// Explicit `remove` diffs dropped because we already issued a Remove for
+    /// that oid earlier in the same message.
+    pub dropped_duplicate_removes: usize,
 }
 
 #[derive(Debug)]
@@ -166,7 +187,7 @@ fn decode_l4(msg: &Value, scales: Scales) -> Result<Decoded, AdapterError> {
     Ok(Decoded::Skip)
 }
 
-fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, AdapterError> {
+fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, AdapterError> {
     // Stash order_statuses by oid so we can enrich `new` diffs with side/ts.
     let mut status_by_oid: std::collections::HashMap<OrderId, &Value> =
         std::collections::HashMap::new();
@@ -182,9 +203,16 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, Adapte
 
     let diffs = match updates.get("book_diffs").and_then(Value::as_array) {
         Some(d) => d,
-        None => return Ok(Vec::new()),
+        None => return Ok(UpdateBatch::default()),
     };
+    // Hyperliquid encodes a complete fill as `update {newSz: "0"}` followed by a
+    // separate `remove` for the same oid in the same message. We collapse both
+    // into a single Remove and skip duplicates so the book sees one removal per
+    // oid per block.
     let mut ops = Vec::with_capacity(diffs.len());
+    let mut removed: std::collections::HashSet<OrderId> = std::collections::HashSet::new();
+    let mut collapsed_complete_fills = 0usize;
+    let mut dropped_duplicate_removes = 0usize;
     for d in diffs {
         let oid = d
             .get("oid")
@@ -196,7 +224,11 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, Adapte
 
         // "remove" is the plain string form.
         if raw.as_str() == Some("remove") {
-            ops.push(BookOp::Remove(oid));
+            if removed.insert(oid) {
+                ops.push(BookOp::Remove(oid));
+            } else {
+                dropped_duplicate_removes += 1;
+            }
             continue;
         }
         let raw_obj = raw
@@ -254,7 +286,16 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, Adapte
                 .ok_or(AdapterError::MissingField("update.newSz"))?;
             let new_qty = parse_fixed(new_sz, scales.qty_digits)
                 .ok_or_else(|| AdapterError::BadQty(new_sz.into()))?;
-            ops.push(BookOp::UpdateSize { id: oid, new_qty });
+            if new_qty == 0 {
+                collapsed_complete_fills += 1;
+                if removed.insert(oid) {
+                    ops.push(BookOp::Remove(oid));
+                } else {
+                    dropped_duplicate_removes += 1;
+                }
+            } else {
+                ops.push(BookOp::UpdateSize { id: oid, new_qty });
+            }
             continue;
         }
         if let Some(m) = raw_obj.get("modified") {
@@ -264,12 +305,25 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<Vec<BookOp>, Adapte
                 .ok_or(AdapterError::MissingField("modified.sz"))?;
             let new_qty = parse_fixed(sz, scales.qty_digits)
                 .ok_or_else(|| AdapterError::BadQty(sz.into()))?;
-            ops.push(BookOp::AmendSize { id: oid, new_qty });
+            if new_qty == 0 {
+                collapsed_complete_fills += 1;
+                if removed.insert(oid) {
+                    ops.push(BookOp::Remove(oid));
+                } else {
+                    dropped_duplicate_removes += 1;
+                }
+            } else {
+                ops.push(BookOp::AmendSize { id: oid, new_qty });
+            }
             continue;
         }
         // Unknown raw_book_diff shape — skip rather than abort the whole replay.
     }
-    Ok(ops)
+    Ok(UpdateBatch {
+        ops,
+        collapsed_complete_fills,
+        dropped_duplicate_removes,
+    })
 }
 
 fn parse_order(
@@ -378,8 +432,8 @@ pub fn load_capture(path: impl AsRef<Path>, scales: Scales) -> Result<Capture, A
             Decoded::Snapshot(mut orders) => {
                 snapshot.append(&mut orders);
             }
-            Decoded::Updates(ops) => {
-                for op in &ops {
+            Decoded::Updates(batch) => {
+                for op in &batch.ops {
                     match op {
                         BookOp::Add(_) => stats.adds += 1,
                         BookOp::Remove(_) => stats.removes += 1,
@@ -387,9 +441,11 @@ pub fn load_capture(path: impl AsRef<Path>, scales: Scales) -> Result<Capture, A
                         BookOp::AmendSize { .. } => stats.size_amends += 1,
                     }
                 }
-                stats.total_ops += ops.len();
+                stats.total_ops += batch.ops.len();
+                stats.collapsed_complete_fills += batch.collapsed_complete_fills;
+                stats.dropped_duplicate_removes += batch.dropped_duplicate_removes;
                 stats.updates_messages += 1;
-                updates.push(ops);
+                updates.push(batch.ops);
             }
         }
     }
@@ -438,13 +494,52 @@ mod tests {
     }
 
     #[test]
+    fn complete_fill_emits_single_remove() {
+        // Hyperliquid encodes a complete fill as `update {newSz: "0"}` for the
+        // last partial chunk PLUS a separate `remove` for the same oid in the
+        // same Updates message. Naively applying both would call remove twice
+        // and produce UnknownOrderId on the second remove. The adapter must
+        // collapse them into a single Remove. This pattern was observed in
+        // dwellir_sp500_debug_log.json (e.g. update=382, oid=402354142920).
+        let line = r#"{"channel":"l4Book","data":{"Updates":{"time":1,"height":2,"order_statuses":[{"time":"t","user":"0xc9909df08b4fd56abd998b2c3abff54af0c9378b","status":"filled","order":{"user":null,"coin":"xyz:SP500","side":"A","limitPx":"7131.6","sz":"0.0","oid":402354142920,"timestamp":123}}],"book_diffs":[{"user":"0xc9909df08b4fd56abd998b2c3abff54af0c9378b","oid":402354142920,"px":"7131.6","coin":"xyz:SP500","raw_book_diff":{"update":{"origSz":"0.007","newSz":"0.0"}}},{"user":"0xc9909df08b4fd56abd998b2c3abff54af0c9378b","oid":402354142920,"px":"7131.6","coin":"xyz:SP500","raw_book_diff":"remove"}]}}}"#;
+        let dec = decode_line(line, Scales::BTC_DEFAULT).unwrap();
+        match dec {
+            Decoded::Updates(batch) => {
+                assert_eq!(batch.ops.len(), 1, "got {:?}", batch.ops);
+                assert!(matches!(batch.ops[0], BookOp::Remove(402354142920)));
+                assert_eq!(batch.collapsed_complete_fills, 1);
+                assert_eq!(batch.dropped_duplicate_removes, 1);
+            }
+            _ => panic!("expected Updates"),
+        }
+    }
+
+    #[test]
+    fn duplicate_remove_in_same_message_is_deduped() {
+        let line = r#"{"channel":"l4Book","data":{"Updates":{"time":1,"height":2,"order_statuses":[],"book_diffs":[{"user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","oid":42,"px":"1","coin":"X","raw_book_diff":"remove"},{"user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","oid":42,"px":"1","coin":"X","raw_book_diff":"remove"}]}}}"#;
+        let dec = decode_line(line, Scales::BTC_DEFAULT).unwrap();
+        match dec {
+            Decoded::Updates(batch) => {
+                assert_eq!(batch.ops.len(), 1);
+                assert!(matches!(batch.ops[0], BookOp::Remove(42)));
+                assert_eq!(batch.collapsed_complete_fills, 0);
+                assert_eq!(batch.dropped_duplicate_removes, 1);
+            }
+            _ => panic!("expected Updates"),
+        }
+    }
+
+    #[test]
     fn decode_updates_line() {
         // One new (paired with open), one remove, one update, one modified.
         let line = r#"{"recv_ns":0,"seq":1,"kind":"Updates","msg":{"channel":"l4Book","data":{"Updates":{"time":1,"height":2,"order_statuses":[{"time":"t","user":"0xbc927e87d072dfac3693846a83fa6922cc6c5f2a","status":"open","order":{"user":null,"coin":"BTC","side":"B","limitPx":"90056.0","sz":"0.00014","oid":100,"timestamp":123}}],"book_diffs":[{"user":"0xbc927e87d072dfac3693846a83fa6922cc6c5f2a","oid":100,"px":"90056.0","coin":"BTC","raw_book_diff":{"new":{"sz":"0.00014"}}},{"user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","oid":7,"px":"90055.0","coin":"BTC","raw_book_diff":"remove"},{"user":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","oid":8,"px":"84.371","coin":"SOL","raw_book_diff":{"update":{"origSz":"108.65","newSz":"107.5"}}},{"user":"0xcccccccccccccccccccccccccccccccccccccccc","oid":9,"px":"1","coin":"X","raw_book_diff":{"modified":{"sz":"2"}}}]}}}}"#;
         let dec = decode_line(line, Scales::BTC_DEFAULT).unwrap();
         match dec {
-            Decoded::Updates(ops) => {
+            Decoded::Updates(batch) => {
+                let ops = &batch.ops;
                 assert_eq!(ops.len(), 4);
+                assert_eq!(batch.collapsed_complete_fills, 0);
+                assert_eq!(batch.dropped_duplicate_removes, 0);
                 match &ops[0] {
                     BookOp::Add(o) => {
                         assert_eq!(o.id, 100);

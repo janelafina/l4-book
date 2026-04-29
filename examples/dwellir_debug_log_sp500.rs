@@ -65,6 +65,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut update_messages = 0usize;
     let mut ops_applied = 0usize;
     let mut errors = 0usize;
+    let mut collapsed_complete_fills = 0usize;
+    let mut dropped_duplicate_removes = 0usize;
 
     loop {
         let msg = match ws.read() {
@@ -165,8 +167,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            Decoded::Updates(ops) => {
+            Decoded::Updates(batch) => {
                 update_messages += 1;
+                collapsed_complete_fills += batch.collapsed_complete_fills;
+                dropped_duplicate_removes += batch.dropped_duplicate_removes;
+                let ops = batch.ops;
                 let should_log_update = update_messages <= updates_to_log;
                 let parsed_update = ops_to_value(&ops);
                 let mut op_results = Vec::with_capacity(ops.len());
@@ -175,8 +180,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     log_marker(
                         &mut log,
                         format!(
-                            "RAW UPDATE update={update_messages} message={messages} ops={}",
-                            ops.len()
+                            "RAW UPDATE update={update_messages} message={messages} ops={} collapsed_complete_fills={} dropped_duplicate_removes={}",
+                            ops.len(),
+                            batch.collapsed_complete_fills,
+                            batch.dropped_duplicate_removes,
                         ),
                     )?;
                     log.write(&json!({
@@ -186,6 +193,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         "messages": messages,
                         "raw_update": text,
                         "parsed_update": parsed_update,
+                        "collapsed_complete_fills": batch.collapsed_complete_fills,
+                        "dropped_duplicate_removes": batch.dropped_duplicate_removes,
                     }))?;
                 }
 
@@ -295,6 +304,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "update_messages": update_messages,
         "ops_applied": ops_applied,
         "errors": errors,
+        "collapsed_complete_fills": collapsed_complete_fills,
+        "dropped_duplicate_removes": dropped_duplicate_removes,
         "book_len": book.len(),
         "best_bid": book.best_bid().map(|p| fmt_scaled(p as u128, scales.price_digits)),
         "best_ask": book.best_ask().map(|p| fmt_scaled(p as u128, scales.price_digits)),
@@ -302,7 +313,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     log.flush()?;
 
     eprintln!(
-        "done: messages={messages} updates={update_messages} ops_applied={ops_applied} errors={errors} log={log_path}"
+        "done: messages={messages} updates={update_messages} ops_applied={ops_applied} errors={errors} collapsed_complete_fills={collapsed_complete_fills} dropped_duplicate_removes={dropped_duplicate_removes} log={log_path}"
     );
     Ok(())
 }

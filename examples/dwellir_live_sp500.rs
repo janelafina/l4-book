@@ -76,10 +76,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 deadline = Some(now + RUN_FOR);
                 eprintln!("snapshot applied: {order_count} orders; reporting every 15s for 2m");
             }
-            Decoded::Updates(ops) => {
+            Decoded::Updates(batch) => {
                 updates += 1;
-                let parsed_message = format!("{ops:#?}");
-                for op in ops {
+                let parsed_message = format!("{:#?}", batch.ops);
+                for op in batch.ops {
                     let parsed_op = format!("{op:#?}");
                     match apply_op(&mut book, op) {
                         Ok(()) => ops_applied += 1,
