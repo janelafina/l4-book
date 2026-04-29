@@ -138,6 +138,32 @@ cargo run --release --example replay_capture --features dwellir
 Prints load time, snapshot apply time, full-stream apply time, and the final
 book shape.
 
+### Live Dwellir SP500 example
+
+```bash
+export DWELLIR_WS_ENDPOINT="wss://<your-dwellir-host>/<your-token>/ws"
+cargo run --release --example dwellir_live_sp500 --features dwellir
+```
+
+The live example subscribes to `l4Book` for `xyz:SP500`, maintains an in-memory
+`OrderBook`, and every 15 seconds for 2 minutes after the snapshot logs top 5
+unaggregated levels, top 5 aggregated levels, and buy/sell slippage estimates
+for $1k and $100k notional orders.
+
+For deeper feed debugging, use the full-book debug logger:
+
+```bash
+export DWELLIR_WS_ENDPOINT="wss://<your-dwellir-host>/<your-token>/ws"
+export DWELLIR_DEBUG_UPDATES=5              # optional; defaults to 5
+export DWELLIR_DEBUG_LOG=dwellir-debug.json # optional; defaults to dwellir_sp500_debug_log.json
+cargo run --release --example dwellir_debug_log_sp500 --features dwellir
+```
+
+The debug logger writes newline-separated pretty JSON objects containing the
+initial full snapshot, raw + parsed forms for the first `DWELLIR_DEBUG_UPDATES`
+update messages, the full book after each of those updates, and all apply/decode
+errors. It stops after 10 accumulated errors.
+
 ### 4. Criterion benchmarks
 
 ```bash
