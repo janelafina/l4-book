@@ -18,4 +18,11 @@ pub use book::{
     AggregatedLevel, AggregatedTopLevels, DepthIter, LevelOrder, OrderBook, OrdersAtLevel,
     SlippageEstimate, UnaggregatedLevel, UnaggregatedTopLevels, WalletIter,
 };
-pub use types::{BookError, Order, OrderId, Price, Qty, Side, Ts, WalletId};
+pub use types::{
+    AmendPriorityPolicy, BookError, BookOp, DuplicateAddPolicy, FillDelta, LimitOrderPolicy,
+    MissingOrderPolicy, NonDecreasingUpdatePolicy, OperationCause, OperationSource, Order, OrderId,
+    Price, Qty, QueuePosition, ReasonedBookOp, ReplayApplyOutcome, ReplayPolicy,
+    SYNTHETIC_ORDER_ID_FLAG, Side, SimulatorCause, SnapshotOutcome, SnapshotPolicy,
+    SubmitLimitOrderOutcome, SubmitRejectReason, TakerMatch, ToleratedReplayReason, Ts,
+    VenueDiffKind, WalletId, is_synthetic_order_id, synthetic_order_id,
+};

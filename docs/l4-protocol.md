@@ -12,6 +12,13 @@ The most detailed market data available - individual order visibility with user 
 
 Clone our complete examples: [github.com/dwellir-public/hyperliquid-orderbook-server-code-examples](https://github.com/dwellir-public/hyperliquid-orderbook-server-code-examples)
 
+> Local adapter note: `l4-book` can preserve Dwellir diff/status metadata as
+> `ReasonedBookOp` causes (`new`, `remove`, `update`, `modified`, collapsed
+> complete fills, and status strings such as `open`, `filled`, or `canceled`).
+> L4 book diffs identify order-state transitions, but they do not reconstruct
+> individual trade counterparties or full execution events without a trades
+> stream.
+
 ## How to Subscribe
 
 Send a subscription message to the WebSocket endpoint:

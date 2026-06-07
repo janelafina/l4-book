@@ -10,30 +10,15 @@
 //! `price_digits = 6` and `qty_digits = 8` are safe defaults (Hyperliquid uses
 //! fewer; truncation is toward zero).
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::{Order, OrderId, Qty, Side, WalletId};
-
-/// Venue-neutral book command emitted from a single Dwellir `Updates` message.
-#[derive(Clone, Debug)]
-pub enum BookOp {
-    Add(Order),
-    Remove(OrderId),
-    /// Partial-fill size reduction. Strictly decreasing per L4 semantics.
-    UpdateSize {
-        id: OrderId,
-        new_qty: Qty,
-    },
-    /// Amendment; may grow or shrink.
-    AmendSize {
-        id: OrderId,
-        new_qty: Qty,
-    },
-}
+pub use crate::BookOp;
+use crate::{OperationCause, Order, OrderId, ReasonedBookOp, Side, VenueDiffKind, WalletId};
 
 /// One line of the capture file, decoded.
 #[derive(Debug)]
@@ -58,12 +43,48 @@ pub struct UpdateBatch {
     pub dropped_duplicate_removes: usize,
 }
 
+/// One line of the capture file decoded with Dwellir-derived cause metadata.
+#[derive(Debug)]
+pub enum DecodedWithMeta {
+    /// Capture header / subscriptionResponse / unrecognized — nothing to apply.
+    Skip,
+    Snapshot {
+        orders: Vec<Order>,
+        cause: OperationCause,
+    },
+    Updates(ReasonedUpdateBatch),
+}
+
+/// Decoded `Updates` payload with per-op cause metadata.
+#[derive(Debug, Default, Clone)]
+pub struct ReasonedUpdateBatch {
+    pub ops: Vec<ReasonedBookOp>,
+    /// `update {newSz: "0"}` (or `modified {sz: "0"}`) diffs that were rewritten
+    /// to a `Remove` because the order's last size went to zero.
+    pub collapsed_complete_fills: usize,
+    /// Explicit `remove` diffs dropped because we already issued a Remove for
+    /// that oid earlier in the same message.
+    pub dropped_duplicate_removes: usize,
+    /// `new` diffs skipped because they lacked a matching `order_status` in the
+    /// same message, so side/timestamp could not be recovered.
+    pub unresolved_new: usize,
+}
+
 /// Whole-file decode result.
 pub struct Capture {
     pub snapshot: Vec<Order>,
     /// Outer vec: one entry per `Updates` message, in arrival order.
     /// Inner vec: ops within that update in arrival order.
     pub updates: Vec<Vec<BookOp>>,
+    pub stats: CaptureStats,
+}
+
+/// Whole-file decode result preserving per-operation cause metadata.
+pub struct ReasonedCapture {
+    pub snapshot: Vec<Order>,
+    /// Outer vec: one entry per `Updates` message, in arrival order.
+    /// Inner vec: reasoned ops within that update in arrival order.
+    pub updates: Vec<Vec<ReasonedBookOp>>,
     pub stats: CaptureStats,
 }
 
@@ -143,24 +164,48 @@ impl Scales {
 
 /// Decode a single JSONL line. Returns `Decoded::Skip` for the capture header
 /// and subscriptionResponse.
+///
+/// This compatibility API strips Dwellir cause metadata. Use
+/// [`decode_line_with_meta`] when callers need diff/status provenance.
 pub fn decode_line(line: &str, scales: Scales) -> Result<Decoded, AdapterError> {
+    decode_line_with_meta(line, scales).map(strip_decoded)
+}
+
+/// Decode a single JSONL line while preserving Dwellir-derived operation causes.
+pub fn decode_line_with_meta(line: &str, scales: Scales) -> Result<DecodedWithMeta, AdapterError> {
     let v: Value = serde_json::from_str(line)?;
     // Capture header written by our own script.
     if v.get("type").and_then(Value::as_str) == Some("capture_header") {
-        return Ok(Decoded::Skip);
+        return Ok(DecodedWithMeta::Skip);
     }
     // Records wrap the wire message in {recv_ns, seq, kind, msg}.
     let msg = v.get("msg").unwrap_or(&v);
 
     let channel = msg.get("channel").and_then(Value::as_str);
     match channel {
-        Some("subscriptionResponse") => Ok(Decoded::Skip),
-        Some("l4Book") => decode_l4(msg, scales),
-        _ => Ok(Decoded::Skip),
+        Some("subscriptionResponse") => Ok(DecodedWithMeta::Skip),
+        Some("l4Book") => decode_l4_with_meta(msg, scales),
+        _ => Ok(DecodedWithMeta::Skip),
     }
 }
 
-fn decode_l4(msg: &Value, scales: Scales) -> Result<Decoded, AdapterError> {
+fn strip_decoded(decoded: DecodedWithMeta) -> Decoded {
+    match decoded {
+        DecodedWithMeta::Skip => Decoded::Skip,
+        DecodedWithMeta::Snapshot { orders, .. } => Decoded::Snapshot(orders),
+        DecodedWithMeta::Updates(batch) => Decoded::Updates(strip_update_batch(batch)),
+    }
+}
+
+fn strip_update_batch(batch: ReasonedUpdateBatch) -> UpdateBatch {
+    UpdateBatch {
+        ops: batch.ops.into_iter().map(|reasoned| reasoned.op).collect(),
+        collapsed_complete_fills: batch.collapsed_complete_fills,
+        dropped_duplicate_removes: batch.dropped_duplicate_removes,
+    }
+}
+
+fn decode_l4_with_meta(msg: &Value, scales: Scales) -> Result<DecodedWithMeta, AdapterError> {
     let data = msg.get("data").ok_or(AdapterError::MissingField("data"))?;
     if let Some(snap) = data.get("Snapshot") {
         let levels = snap
@@ -179,18 +224,26 @@ fn decode_l4(msg: &Value, scales: Scales) -> Result<Decoded, AdapterError> {
                 }
             }
         }
-        return Ok(Decoded::Snapshot(out));
+        return Ok(DecodedWithMeta::Snapshot {
+            orders: out,
+            cause: OperationCause::Snapshot,
+        });
     }
     if let Some(updates) = data.get("Updates") {
-        return Ok(Decoded::Updates(decode_updates(updates, scales)?));
+        return Ok(DecodedWithMeta::Updates(decode_updates_with_meta(
+            updates, scales,
+        )?));
     }
-    Ok(Decoded::Skip)
+    Ok(DecodedWithMeta::Skip)
 }
 
-fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, AdapterError> {
-    // Stash order_statuses by oid so we can enrich `new` diffs with side/ts.
-    let mut status_by_oid: std::collections::HashMap<OrderId, &Value> =
-        std::collections::HashMap::new();
+fn decode_updates_with_meta(
+    updates: &Value,
+    scales: Scales,
+) -> Result<ReasonedUpdateBatch, AdapterError> {
+    // Stash order_statuses by oid so we can enrich diffs with venue status and
+    // recover side/timestamp for `new` diffs.
+    let mut status_by_oid: HashMap<OrderId, &Value> = HashMap::new();
     if let Some(arr) = updates.get("order_statuses").and_then(Value::as_array) {
         for s in arr {
             if let Some(order) = s.get("order") {
@@ -203,16 +256,17 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, Adapte
 
     let diffs = match updates.get("book_diffs").and_then(Value::as_array) {
         Some(d) => d,
-        None => return Ok(UpdateBatch::default()),
+        None => return Ok(ReasonedUpdateBatch::default()),
     };
     // Hyperliquid encodes a complete fill as `update {newSz: "0"}` followed by a
     // separate `remove` for the same oid in the same message. We collapse both
     // into a single Remove and skip duplicates so the book sees one removal per
     // oid per block.
     let mut ops = Vec::with_capacity(diffs.len());
-    let mut removed: std::collections::HashSet<OrderId> = std::collections::HashSet::new();
+    let mut removed: HashSet<OrderId> = HashSet::new();
     let mut collapsed_complete_fills = 0usize;
     let mut dropped_duplicate_removes = 0usize;
+    let mut unresolved_new = 0usize;
     for d in diffs {
         let oid = d
             .get("oid")
@@ -225,7 +279,11 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, Adapte
         // "remove" is the plain string form.
         if raw.as_str() == Some("remove") {
             if removed.insert(oid) {
-                ops.push(BookOp::Remove(oid));
+                ops.push(reasoned_venue_op(
+                    BookOp::Remove(oid),
+                    VenueDiffKind::Remove,
+                    status_text(&status_by_oid, oid),
+                ));
             } else {
                 dropped_duplicate_removes += 1;
             }
@@ -253,6 +311,7 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, Adapte
             let Some(status) = status_by_oid.get(&oid) else {
                 // `new` without matching order_status — skip; adapter caller can
                 // count these via stats to detect capture gaps.
+                unresolved_new += 1;
                 continue;
             };
             let order_obj = status
@@ -269,14 +328,21 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, Adapte
                 .ok_or_else(|| AdapterError::BadPrice(px_str.into()))?;
             let qty = parse_fixed(sz_str, scales.qty_digits)
                 .ok_or_else(|| AdapterError::BadQty(sz_str.into()))?;
-            ops.push(BookOp::Add(Order {
-                id: oid,
-                wallet,
-                side,
-                price,
-                qty,
-                ts,
-            }));
+            ops.push(reasoned_venue_op(
+                BookOp::Add(Order {
+                    id: oid,
+                    wallet,
+                    side,
+                    price,
+                    qty,
+                    ts,
+                }),
+                VenueDiffKind::New,
+                status
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ));
             continue;
         }
         if let Some(upd) = raw_obj.get("update") {
@@ -289,12 +355,20 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, Adapte
             if new_qty == 0 {
                 collapsed_complete_fills += 1;
                 if removed.insert(oid) {
-                    ops.push(BookOp::Remove(oid));
+                    ops.push(reasoned_venue_op(
+                        BookOp::Remove(oid),
+                        VenueDiffKind::CompleteFillCollapsed,
+                        status_text(&status_by_oid, oid),
+                    ));
                 } else {
                     dropped_duplicate_removes += 1;
                 }
             } else {
-                ops.push(BookOp::UpdateSize { id: oid, new_qty });
+                ops.push(reasoned_venue_op(
+                    BookOp::UpdateSize { id: oid, new_qty },
+                    VenueDiffKind::Update,
+                    status_text(&status_by_oid, oid),
+                ));
             }
             continue;
         }
@@ -308,22 +382,50 @@ fn decode_updates(updates: &Value, scales: Scales) -> Result<UpdateBatch, Adapte
             if new_qty == 0 {
                 collapsed_complete_fills += 1;
                 if removed.insert(oid) {
-                    ops.push(BookOp::Remove(oid));
+                    ops.push(reasoned_venue_op(
+                        BookOp::Remove(oid),
+                        VenueDiffKind::CompleteFillCollapsed,
+                        status_text(&status_by_oid, oid),
+                    ));
                 } else {
                     dropped_duplicate_removes += 1;
                 }
             } else {
-                ops.push(BookOp::AmendSize { id: oid, new_qty });
+                ops.push(reasoned_venue_op(
+                    BookOp::AmendSize { id: oid, new_qty },
+                    VenueDiffKind::Modified,
+                    status_text(&status_by_oid, oid),
+                ));
             }
             continue;
         }
         // Unknown raw_book_diff shape — skip rather than abort the whole replay.
     }
-    Ok(UpdateBatch {
+    Ok(ReasonedUpdateBatch {
         ops,
         collapsed_complete_fills,
         dropped_duplicate_removes,
+        unresolved_new,
     })
+}
+
+fn reasoned_venue_op(op: BookOp, diff: VenueDiffKind, status: Option<String>) -> ReasonedBookOp {
+    ReasonedBookOp::new(
+        op,
+        OperationCause::Venue {
+            source: "dwellir",
+            diff,
+            status,
+        },
+    )
+}
+
+fn status_text(status_by_oid: &HashMap<OrderId, &Value>, oid: OrderId) -> Option<String> {
+    status_by_oid
+        .get(&oid)
+        .and_then(|status| status.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn parse_order(
@@ -427,25 +529,14 @@ pub fn load_capture(path: impl AsRef<Path>, scales: Scales) -> Result<Capture, A
             continue;
         }
         stats.lines += 1;
-        match decode_line(&line, scales)? {
-            Decoded::Skip => {}
-            Decoded::Snapshot(mut orders) => {
+        match decode_line_with_meta(&line, scales)? {
+            DecodedWithMeta::Skip => {}
+            DecodedWithMeta::Snapshot { mut orders, .. } => {
                 snapshot.append(&mut orders);
             }
-            Decoded::Updates(batch) => {
-                for op in &batch.ops {
-                    match op {
-                        BookOp::Add(_) => stats.adds += 1,
-                        BookOp::Remove(_) => stats.removes += 1,
-                        BookOp::UpdateSize { .. } => stats.size_updates += 1,
-                        BookOp::AmendSize { .. } => stats.size_amends += 1,
-                    }
-                }
-                stats.total_ops += batch.ops.len();
-                stats.collapsed_complete_fills += batch.collapsed_complete_fills;
-                stats.dropped_duplicate_removes += batch.dropped_duplicate_removes;
-                stats.updates_messages += 1;
-                updates.push(batch.ops);
+            DecodedWithMeta::Updates(batch) => {
+                accumulate_stats(&mut stats, &batch);
+                updates.push(batch.ops.into_iter().map(|reasoned| reasoned.op).collect());
             }
         }
     }
@@ -455,6 +546,60 @@ pub fn load_capture(path: impl AsRef<Path>, scales: Scales) -> Result<Capture, A
         updates,
         stats,
     })
+}
+
+/// Read an entire capture file into memory, preserving per-operation cause metadata.
+pub fn load_capture_with_meta(
+    path: impl AsRef<Path>,
+    scales: Scales,
+) -> Result<ReasonedCapture, AdapterError> {
+    let file = File::open(path.as_ref())?;
+    // Capture files are large (>1 GB) — wide buffer amortizes syscalls.
+    let reader = BufReader::with_capacity(1 << 20, file);
+
+    let mut snapshot = Vec::new();
+    let mut updates: Vec<Vec<ReasonedBookOp>> = Vec::new();
+    let mut stats = CaptureStats::default();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        stats.lines += 1;
+        match decode_line_with_meta(&line, scales)? {
+            DecodedWithMeta::Skip => {}
+            DecodedWithMeta::Snapshot { mut orders, .. } => {
+                snapshot.append(&mut orders);
+            }
+            DecodedWithMeta::Updates(batch) => {
+                accumulate_stats(&mut stats, &batch);
+                updates.push(batch.ops);
+            }
+        }
+    }
+
+    Ok(ReasonedCapture {
+        snapshot,
+        updates,
+        stats,
+    })
+}
+
+fn accumulate_stats(stats: &mut CaptureStats, batch: &ReasonedUpdateBatch) {
+    for reasoned in &batch.ops {
+        match reasoned.op {
+            BookOp::Add(_) => stats.adds += 1,
+            BookOp::Remove(_) => stats.removes += 1,
+            BookOp::UpdateSize { .. } => stats.size_updates += 1,
+            BookOp::AmendSize { .. } => stats.size_amends += 1,
+        }
+    }
+    stats.total_ops += batch.ops.len();
+    stats.unresolved_new += batch.unresolved_new;
+    stats.collapsed_complete_fills += batch.collapsed_complete_fills;
+    stats.dropped_duplicate_removes += batch.dropped_duplicate_removes;
+    stats.updates_messages += 1;
 }
 
 #[cfg(test)]
@@ -559,6 +704,76 @@ mod tests {
                 }
             }
             _ => panic!("expected Updates"),
+        }
+    }
+
+    #[test]
+    fn decode_updates_with_meta_preserves_diff_causes_and_statuses() {
+        let line = r#"{"recv_ns":0,"seq":1,"kind":"Updates","msg":{"channel":"l4Book","data":{"Updates":{"time":1,"height":2,"order_statuses":[{"time":"t","user":"0xbc927e87d072dfac3693846a83fa6922cc6c5f2a","status":"open","order":{"user":null,"coin":"BTC","side":"B","limitPx":"90056.0","sz":"0.00014","oid":100,"timestamp":123}},{"time":"t","user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"canceled","order":{"user":null,"coin":"BTC","side":"A","limitPx":"90055.0","sz":"0","oid":7,"timestamp":124}},{"time":"t","user":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"open","order":{"user":null,"coin":"SOL","side":"B","limitPx":"84.371","sz":"107.5","oid":8,"timestamp":125}},{"time":"t","user":"0xcccccccccccccccccccccccccccccccccccccccc","status":"open","order":{"user":null,"coin":"X","side":"A","limitPx":"1","sz":"2","oid":9,"timestamp":126}}],"book_diffs":[{"user":"0xbc927e87d072dfac3693846a83fa6922cc6c5f2a","oid":100,"px":"90056.0","coin":"BTC","raw_book_diff":{"new":{"sz":"0.00014"}}},{"user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","oid":7,"px":"90055.0","coin":"BTC","raw_book_diff":"remove"},{"user":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","oid":8,"px":"84.371","coin":"SOL","raw_book_diff":{"update":{"origSz":"108.65","newSz":"107.5"}}},{"user":"0xcccccccccccccccccccccccccccccccccccccccc","oid":9,"px":"1","coin":"X","raw_book_diff":{"modified":{"sz":"2"}}}]}}}}"#;
+        let dec = decode_line_with_meta(line, Scales::BTC_DEFAULT).unwrap();
+        match dec {
+            DecodedWithMeta::Updates(batch) => {
+                assert_eq!(batch.ops.len(), 4);
+                assert_venue_cause(&batch.ops[0], VenueDiffKind::New, Some("open"));
+                assert_venue_cause(&batch.ops[1], VenueDiffKind::Remove, Some("canceled"));
+                assert_venue_cause(&batch.ops[2], VenueDiffKind::Update, Some("open"));
+                assert_venue_cause(&batch.ops[3], VenueDiffKind::Modified, Some("open"));
+            }
+            _ => panic!("expected Updates"),
+        }
+    }
+
+    #[test]
+    fn complete_fill_with_meta_reports_collapsed_cause() {
+        let line = r#"{"channel":"l4Book","data":{"Updates":{"time":1,"height":2,"order_statuses":[{"time":"t","user":"0xc9909df08b4fd56abd998b2c3abff54af0c9378b","status":"filled","order":{"user":null,"coin":"xyz:SP500","side":"A","limitPx":"7131.6","sz":"0.0","oid":402354142920,"timestamp":123}}],"book_diffs":[{"user":"0xc9909df08b4fd56abd998b2c3abff54af0c9378b","oid":402354142920,"px":"7131.6","coin":"xyz:SP500","raw_book_diff":{"update":{"origSz":"0.007","newSz":"0.0"}}},{"user":"0xc9909df08b4fd56abd998b2c3abff54af0c9378b","oid":402354142920,"px":"7131.6","coin":"xyz:SP500","raw_book_diff":"remove"}]}}}"#;
+        let dec = decode_line_with_meta(line, Scales::BTC_DEFAULT).unwrap();
+        match dec {
+            DecodedWithMeta::Updates(batch) => {
+                assert_eq!(batch.ops.len(), 1);
+                assert_eq!(batch.collapsed_complete_fills, 1);
+                assert_eq!(batch.dropped_duplicate_removes, 1);
+                assert!(matches!(batch.ops[0].op, BookOp::Remove(402354142920)));
+                assert_venue_cause(
+                    &batch.ops[0],
+                    VenueDiffKind::CompleteFillCollapsed,
+                    Some("filled"),
+                );
+            }
+            _ => panic!("expected Updates"),
+        }
+    }
+
+    #[test]
+    fn unresolved_new_with_meta_is_counted_and_skipped() {
+        let line = r#"{"channel":"l4Book","data":{"Updates":{"time":1,"height":2,"order_statuses":[],"book_diffs":[{"user":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","oid":42,"px":"1","coin":"X","raw_book_diff":{"new":{"sz":"1"}}}]}}}"#;
+        let dec = decode_line_with_meta(line, Scales::BTC_DEFAULT).unwrap();
+        match dec {
+            DecodedWithMeta::Updates(batch) => {
+                assert!(batch.ops.is_empty());
+                assert_eq!(batch.unresolved_new, 1);
+                assert_eq!(batch.collapsed_complete_fills, 0);
+                assert_eq!(batch.dropped_duplicate_removes, 0);
+            }
+            _ => panic!("expected Updates"),
+        }
+    }
+
+    fn assert_venue_cause(
+        reasoned: &ReasonedBookOp,
+        expected_diff: VenueDiffKind,
+        expected_status: Option<&str>,
+    ) {
+        match &reasoned.cause {
+            OperationCause::Venue {
+                source,
+                diff,
+                status,
+            } => {
+                assert_eq!(*source, "dwellir");
+                assert_eq!(*diff, expected_diff);
+                assert_eq!(status.as_deref(), expected_status);
+            }
+            other => panic!("expected venue cause, got {other:?}"),
         }
     }
 }

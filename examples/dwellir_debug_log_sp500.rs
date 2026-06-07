@@ -16,8 +16,10 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
-use l4_book::dwellir::{BookOp, Decoded, Scales, decode_line};
-use l4_book::{Order, OrderBook, Side};
+use l4_book::dwellir::{BookOp, DecodedWithMeta, Scales, decode_line_with_meta};
+use l4_book::{
+    OperationCause, Order, OrderBook, ReasonedBookOp, Side, SimulatorCause, VenueDiffKind,
+};
 use serde_json::{Value, json};
 use tungstenite::{Message, connect};
 
@@ -114,7 +116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
 
-        let decoded = match decode_line(&text, scales) {
+        let decoded = match decode_line_with_meta(&text, scales) {
             Ok(decoded) => decoded,
             Err(err) => {
                 errors += 1;
@@ -132,8 +134,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         match decoded {
-            Decoded::Skip => {}
-            Decoded::Snapshot(orders) => {
+            DecodedWithMeta::Skip => {}
+            DecodedWithMeta::Snapshot { orders, cause } => {
                 let order_count = orders.len();
                 match book.apply_snapshot(orders) {
                     Ok(()) => {
@@ -148,6 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "marker": "FULL SNAPSHOT INITIAL",
                             "messages": messages,
                             "order_count": order_count,
+                            "cause": operation_cause_to_value(&cause),
                             "book": book_snapshot(&book, scales),
                         }))?;
                         eprintln!("snapshot applied: {order_count} orders");
@@ -167,7 +170,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            Decoded::Updates(batch) => {
+            DecodedWithMeta::Updates(batch) => {
                 update_messages += 1;
                 collapsed_complete_fills += batch.collapsed_complete_fills;
                 dropped_duplicate_removes += batch.dropped_duplicate_removes;
@@ -199,10 +202,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 for (op_index, op) in ops.iter().enumerate() {
-                    let parsed_op = book_op_to_value(op);
-                    let order_id = op_order_id(op);
-                    let op_kind = op_kind(op);
-                    match apply_op(&mut book, op.clone()) {
+                    let parsed_op = reasoned_book_op_to_value(op);
+                    let order_id = op_order_id(&op.op);
+                    let op_kind = op_kind(&op.op);
+                    match book.apply_op(op.op) {
                         Ok(()) => {
                             ops_applied += 1;
                             let marker = format!(
@@ -318,15 +321,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn apply_op(book: &mut OrderBook, op: BookOp) -> Result<(), l4_book::BookError> {
-    match op {
-        BookOp::Add(order) => book.add(order),
-        BookOp::Remove(id) => book.remove(id).map(|_| ()),
-        BookOp::UpdateSize { id, new_qty } => book.update_size(id, new_qty),
-        BookOp::AmendSize { id, new_qty } => book.amend_size(id, new_qty),
-    }
-}
-
 fn book_snapshot(book: &OrderBook, scales: Scales) -> Value {
     json!({
         "len": book.len(),
@@ -371,8 +365,15 @@ fn order_to_value(order: &Order, scales: Scales) -> Value {
     })
 }
 
-fn ops_to_value(ops: &[BookOp]) -> Value {
-    Value::Array(ops.iter().map(book_op_to_value).collect())
+fn ops_to_value(ops: &[ReasonedBookOp]) -> Value {
+    Value::Array(ops.iter().map(reasoned_book_op_to_value).collect())
+}
+
+fn reasoned_book_op_to_value(reasoned: &ReasonedBookOp) -> Value {
+    json!({
+        "op": book_op_to_value(&reasoned.op),
+        "cause": operation_cause_to_value(&reasoned.cause),
+    })
 }
 
 fn book_op_to_value(op: &BookOp) -> Value {
@@ -402,6 +403,51 @@ fn book_op_to_value(op: &BookOp) -> Value {
             "id": id,
             "raw_new_qty": new_qty,
         }),
+    }
+}
+
+fn operation_cause_to_value(cause: &OperationCause) -> Value {
+    match cause {
+        OperationCause::Venue {
+            source,
+            diff,
+            status,
+        } => json!({
+            "source": source,
+            "diff": venue_diff_kind_name(*diff),
+            "status": status,
+        }),
+        OperationCause::Simulator(cause) => json!({
+            "source": "simulator",
+            "cause": simulator_cause_name(*cause),
+        }),
+        OperationCause::Snapshot => json!({
+            "source": "snapshot",
+        }),
+        OperationCause::User => json!({
+            "source": "user",
+        }),
+        OperationCause::Unknown => json!({
+            "source": "unknown",
+        }),
+    }
+}
+
+fn venue_diff_kind_name(kind: VenueDiffKind) -> &'static str {
+    match kind {
+        VenueDiffKind::New => "new",
+        VenueDiffKind::Remove => "remove",
+        VenueDiffKind::Update => "update",
+        VenueDiffKind::Modified => "modified",
+        VenueDiffKind::CompleteFillCollapsed => "complete_fill_collapsed",
+    }
+}
+
+fn simulator_cause_name(cause: SimulatorCause) -> &'static str {
+    match cause {
+        SimulatorCause::TakerFill => "taker_fill",
+        SimulatorCause::LimitOrderRest => "limit_order_rest",
+        SimulatorCause::SnapshotPreserve => "snapshot_preserve",
     }
 }
 

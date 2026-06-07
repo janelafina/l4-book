@@ -39,20 +39,7 @@ fn load() -> Capture {
 
 fn apply_ops(book: &mut OrderBook, ops: &[BookOp]) {
     for op in ops {
-        match op {
-            BookOp::Add(o) => {
-                let _ = book.add(*o);
-            }
-            BookOp::Remove(id) => {
-                let _ = book.remove(*id);
-            }
-            BookOp::UpdateSize { id, new_qty } => {
-                let _ = book.update_size(*id, *new_qty);
-            }
-            BookOp::AmendSize { id, new_qty } => {
-                let _ = book.amend_size(*id, *new_qty);
-            }
-        }
+        let _ = book.apply_op(*op);
     }
 }
 
@@ -108,18 +95,9 @@ fn bench_per_update(c: &mut Criterion, cap: &Capture) {
     let sample = cap.updates[mid].clone();
     let mut g = c.benchmark_group("per_update");
     g.throughput(Throughput::Elements(sample.len() as u64));
-    // Build a pre-warmed book once; each iter applies `sample` then reverts by
-    // resetting from a cloned pristine book. Cloning is expensive, so do it in
-    // setup (iter_batched_ref).
-    let warm = {
-        let mut book = OrderBook::with_capacity(cap.snapshot.len() + 65_536);
-        apply_snapshot(&mut book, &cap.snapshot);
-        // Run up to mid-1 so state mirrors what the middle update will see.
-        for ops in &cap.updates[..mid] {
-            apply_ops(&mut book, ops);
-        }
-        book
-    };
+    // Each iteration builds state as of `mid - 1`, applies `sample`, then drops
+    // that warmed book. This keeps the measured path aligned with public replay
+    // helpers without mutating shared state across iterations.
     g.sample_size(50);
     g.bench_function(format!("mid_update_{}_ops", sample.len()), |b| {
         b.iter_batched_ref(

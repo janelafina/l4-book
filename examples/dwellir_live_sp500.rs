@@ -10,7 +10,7 @@
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use l4_book::dwellir::{BookOp, Decoded, Scales, decode_line};
+use l4_book::dwellir::{Decoded, Scales, decode_line};
 use l4_book::{OrderBook, Price, Qty, Side, SlippageEstimate};
 use serde_json::json;
 use tungstenite::{Message, connect};
@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let parsed_message = format!("{:#?}", batch.ops);
                 for op in batch.ops {
                     let parsed_op = format!("{op:#?}");
-                    match apply_op(&mut book, op) {
+                    match book.apply_op(op) {
                         Ok(()) => ops_applied += 1,
                         Err(err) => {
                             op_errors += 1;
@@ -126,15 +126,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         fmt_price_opt(book.best_ask(), scales),
     );
     Ok(())
-}
-
-fn apply_op(book: &mut OrderBook, op: BookOp) -> Result<(), l4_book::BookError> {
-    match op {
-        BookOp::Add(order) => book.add(order),
-        BookOp::Remove(id) => book.remove(id).map(|_| ()),
-        BookOp::UpdateSize { id, new_qty } => book.update_size(id, new_qty),
-        BookOp::AmendSize { id, new_qty } => book.amend_size(id, new_qty),
-    }
 }
 
 fn log_report(

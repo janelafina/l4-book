@@ -3,8 +3,8 @@
 
 use std::time::Instant;
 
-use l4_book::dwellir::{BookOp, Scales, load_capture};
-use l4_book::{OrderBook, Side};
+use l4_book::dwellir::{Scales, load_capture};
+use l4_book::{OrderBook, ReplayApplyOutcome, ReplayPolicy, Side};
 
 fn main() {
     let path = std::env::var("L4_CAPTURE")
@@ -46,34 +46,36 @@ fn main() {
             .and_then(|a| book.best_bid().map(|b| a.saturating_sub(b)))
     );
 
+    let strict = std::env::var("L4_REPLAY_STRICT")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let policy = if strict {
+        ReplayPolicy::STRICT
+    } else {
+        ReplayPolicy::DWELLIR_TOLERANT
+    };
+    println!(
+        "replay policy: {}",
+        if strict { "strict" } else { "dwellir_tolerant" }
+    );
+
     let t2 = Instant::now();
-    let mut errs_add = 0u64;
-    let mut errs_rm = 0u64;
-    let mut errs_upd = 0u64;
-    let mut errs_amend = 0u64;
+    let mut applied = 0u64;
+    let mut skipped = 0u64;
+    let mut coerced = 0u64;
+    let mut errors = 0u64;
+    let mut anomaly_samples = Vec::new();
     for ops in &cap.updates {
         for op in ops {
-            match op {
-                BookOp::Add(o) => {
-                    if book.add(*o).is_err() {
-                        errs_add += 1
-                    }
-                }
-                BookOp::Remove(id) => {
-                    if book.remove(*id).is_err() {
-                        errs_rm += 1
-                    }
-                }
-                BookOp::UpdateSize { id, new_qty } => {
-                    if book.update_size(*id, *new_qty).is_err() {
-                        errs_upd += 1
-                    }
-                }
-                BookOp::AmendSize { id, new_qty } => {
-                    if book.amend_size(*id, *new_qty).is_err() {
-                        errs_amend += 1
-                    }
-                }
+            let outcome = book.apply_op_with_policy(*op, policy);
+            match &outcome {
+                ReplayApplyOutcome::Applied { .. } => applied += 1,
+                ReplayApplyOutcome::Skipped { .. } => skipped += 1,
+                ReplayApplyOutcome::Coerced { .. } => coerced += 1,
+                ReplayApplyOutcome::Error { .. } => errors += 1,
+            }
+            if anomaly_samples.len() < 5 && !matches!(outcome, ReplayApplyOutcome::Applied { .. }) {
+                anomaly_samples.push(format!("{outcome:?}"));
             }
         }
     }
@@ -85,9 +87,15 @@ fn main() {
         cap.stats.total_ops as f64 / stream_s,
     );
     println!(
-        "  errors: add={} remove={} update_size={} amend={} (typically zero when stream is consistent)",
-        errs_add, errs_rm, errs_upd, errs_amend,
+        "  replay outcomes: applied={} skipped={} coerced={} errors={} (strict errors should be zero when stream is consistent)",
+        applied, skipped, coerced, errors,
     );
+    if !anomaly_samples.is_empty() {
+        println!("  first replay anomalies:");
+        for sample in anomaly_samples {
+            println!("    {sample}");
+        }
+    }
     println!(
         "  final book: len={}  bids_levels={}  asks_levels={}  best_bid={:?}  best_ask={:?}",
         book.len(),

@@ -29,10 +29,16 @@ l4-book/
 ├── scripts/
 │   ├── capture_l4.py     WebSocket capture → JSONL
 │   └── requirements.txt
+├── docs/api.md           public crate API overview
 └── docs/l4-protocol.md   Dwellir L4 wire-format reference (verbatim)
 ```
 
 ## Core API
+
+See [`docs/api.md`](docs/api.md) for a compact reference covering the book data
+structure, public types, mutation/query methods, iterator outputs, snapshots,
+slippage estimates, counterfactual simulator APIs, replay helpers, and the
+optional Dwellir adapter.
 
 ```rust
 use l4_book::{OrderBook, Order, Side, WalletId};
@@ -48,7 +54,49 @@ book.best_bid_ask();                             // (Option<Price>, Option<Price
 book.depth(Side::Bid);                           // iter (price, total_qty, order_count)
 book.orders_at(Side::Bid, price);                // iter &Order in FIFO order
 book.orders_by_wallet(wallet);                   // iter &Order
+book.queue_position(id)?;                          // FIFO orders/qty ahead/behind
 ```
+
+### Counterfactual simulator APIs
+
+The crate includes local deterministic simulator helpers for "what if" analysis.
+They walk the current in-memory book by price-time priority; they are not a
+venue matcher and do not infer hidden venue state.
+
+```rust
+use l4_book::{
+    LimitOrderPolicy, Order, ReplayApplyOutcome, ReplayPolicy, Side,
+    SnapshotPolicy, synthetic_order_id,
+};
+
+// Inspect queue position for live or hypothetical orders.
+let pos = book.queue_position(id)?;
+let join_tail = book.queue_position_for_new_order(Side::Bid, price);
+
+// Simulate per-maker fills without mutation, or apply them to the book.
+let simulated = book.match_taker_order(Side::Bid, 10_000, 50_100);
+let applied = book.apply_taker_order(Side::Bid, 10_000, 50_100)?;
+
+// Submit a local synthetic GTC/IOC/FOK/PostOnly limit order.
+let sim_id = synthetic_order_id(1).expect("local id must not already use high bit");
+let outcome = book.submit_limit_order(
+    Order { id: sim_id, wallet, side: Side::Bid, price: 50_100, qty: 10_000, ts },
+    LimitOrderPolicy::Gtc,
+)?;
+
+// Preserve high-bit synthetic orders across venue snapshots when desired.
+let snap = book.apply_snapshot_with_policy(venue_snapshot, SnapshotPolicy::PreserveSynthetic)?;
+
+// Adapter/replay paths can use strict validation or tolerant diagnostics.
+match book.apply_op_with_policy(op, ReplayPolicy::DWELLIR_TOLERANT) {
+    ReplayApplyOutcome::Applied { .. } => {}
+    other => eprintln!("replay anomaly: {other:?}"),
+}
+```
+
+Synthetic order IDs use the high bit by convention. The namespace is advisory
+because `OrderId` is still a plain `u64`; adapters should validate venue IDs
+before relying on preserved synthetic orders.
 
 ### Top-of-book snapshots and slippage
 
@@ -94,8 +142,10 @@ est.is_complete();
 * **`HashMap<OrderId, slot>`** for O(1) lookup by id.
 * **`HashMap<WalletId, HashSet<OrderId>>`** is the L4 attribution index.
 * **Empty-level pruning** on last-order removal keeps the price tree compact.
-* **No matcher** — Hyperliquid matches upstream and we just reconstruct the
-  book from snapshot + diffs. Easy to add later.
+* **No venue matcher** — venues match upstream and adapters reconstruct the
+  book from snapshot + diffs. The crate also provides local deterministic
+  simulator matching for counterfactual analysis (`match_taker_order`,
+  `apply_taker_order`, and `submit_limit_order`).
 
 ## Tests
 
@@ -135,8 +185,10 @@ The output is newline-delimited JSON with a metadata header line followed by
 cargo run --release --example replay_capture --features dwellir
 ```
 
-Prints load time, snapshot apply time, full-stream apply time, and the final
-book shape.
+Prints load time, snapshot apply time, full-stream apply time, replay outcome
+counts, and the final book shape. By default it uses `ReplayPolicy::DWELLIR_TOLERANT`
+so known feed artifacts are counted instead of aborting; set
+`L4_REPLAY_STRICT=1` to validate with strict `apply_op`-equivalent behavior.
 
 ### Live Dwellir SP500 example
 
@@ -161,8 +213,9 @@ cargo run --release --example dwellir_debug_log_sp500 --features dwellir
 
 The debug logger writes newline-separated pretty JSON objects containing the
 initial full snapshot, raw + parsed forms for the first `DWELLIR_DEBUG_UPDATES`
-update messages, the full book after each of those updates, and all apply/decode
-errors. It stops after 10 accumulated errors.
+update messages, Dwellir-derived operation causes, the full book after each of
+those updates, and all apply/decode errors. It stops after 10 accumulated
+errors.
 
 ### 4. Criterion benchmarks
 
