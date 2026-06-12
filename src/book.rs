@@ -1,5 +1,7 @@
 use std::collections::btree_map;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::level::{Level, OrderNode};
 use crate::types::{
@@ -99,6 +101,7 @@ impl SlippageEstimate {
 ///   doubly-linked list through slab nodes preserving FIFO time priority.
 /// * `wallet_index` maps `WalletId` -> set of orders the wallet currently has
 ///   resting on the book; this is the L4 attribution surface.
+#[derive(Clone)]
 pub struct OrderBook {
     slab: Vec<Option<OrderNode>>,
     free_list: Vec<usize>,
@@ -119,10 +122,10 @@ impl OrderBook {
         Self {
             slab: Vec::new(),
             free_list: Vec::new(),
-            order_index: HashMap::new(),
+            order_index: HashMap::default(),
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            wallet_index: HashMap::new(),
+            wallet_index: HashMap::default(),
         }
     }
 
@@ -871,6 +874,18 @@ impl OrderBook {
 
     /// Iterate orders at a single price level in FIFO order. Returns an empty
     /// iterator if the level doesn't exist.
+    /// Returns `(total_qty, order_count)` for one price level, or `None` when
+    /// no orders rest there. O(log levels); does not touch individual orders.
+    pub fn level_summary(&self, side: Side, price: Price) -> Option<(Qty, u64)> {
+        let levels = match side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+        levels
+            .get(&price)
+            .map(|level| (level.total_qty, level.order_count))
+    }
+
     pub fn orders_at(&self, side: Side, price: Price) -> OrdersAtLevel<'_> {
         let levels = match side {
             Side::Bid => &self.bids,
@@ -992,7 +1007,7 @@ fn validate_preserve_synthetic_snapshot(
     preserved: &[Order],
 ) -> Result<(), BookError> {
     let preserved_ids: HashSet<OrderId> = preserved.iter().map(|order| order.id).collect();
-    let mut seen_snapshot_ids = HashSet::new();
+    let mut seen_snapshot_ids = HashSet::default();
     for order in orders {
         if order.qty == 0 {
             return Err(BookError::ZeroQty);
